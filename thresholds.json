@@ -1,0 +1,5 @@
+{
+  "global": {"red_max": 40, "yellow_max": 70},
+  "by_program": {},
+  "advanced": {"mid_low": 60, "final_low": 60, "cross_gap": 20}
+}
