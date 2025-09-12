@@ -25,7 +25,7 @@ with st.sidebar:
 def load_score_df(file):
     if file is None:
         try:
-            return pd.read_excel("2025-biochem_mobio_score.xlsx", sheet_name="score")
+            return pd.read_excel("2025-biochem_molbio_score.xlsx", sheet_name="score")
         except Exception as e:
             st.error("未上傳檔案，且找不到預設檔")
             st.stop()
