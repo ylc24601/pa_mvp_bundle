@@ -1,15 +1,14 @@
-
 import streamlit as st
 import pandas as pd
 from io import BytesIO
+from pathlib import Path
 
 st.set_page_config(page_title="成績預警儀表板", layout="wide")
-
-st.title("成績預警儀表板（兩科按週）")
+st.title("成績預警儀表板")
 
 with st.sidebar:
-    st.header("檔案與門檻與篩選")
-    uploaded = st.file_uploader("上傳成績檔（Excel, 需包含 'score' 工作表，欄位：ID, Biochem, MolBio, Week）", type=["xlsx"])
+    st.header("檔案、門檻與篩選")
+    uploaded = st.file_uploader("上傳成績檔（Excel, 需包含 'score' 工作表，欄位：ID, Name, Biochem, MolBio, Week）", type=["xlsx"])
     red_th = st.number_input("紅色門檻（未達）", min_value=0, max_value=100, value=40, step=1)
     yellow_th = st.number_input("黃色上限（含）", min_value=0, max_value=100, value=60, step=1)
     win_len = st.number_input("警示連續週數（任一科）", min_value=2, max_value=18, value=3, step=1)
@@ -21,45 +20,58 @@ with st.sidebar:
     if yellow_th < red_th:
         st.warning("⚠️ 黃色上限應大於等於紅色門檻（目前黃={yellow} < 紅={red}）。".format(yellow=yellow_th, red=red_th))
 
-@st.cache_data
+@st.cache_data(show_spinner=False)
 def load_score_df(file):
-    if file is None:
-        try:
-            return pd.read_excel("2025-biochem_molbio_score.xlsx", sheet_name="score")
-        except Exception as e:
-            st.error("未上傳檔案，且找不到預設檔")
-            st.stop()
-    else:
+    # 1) 使用者上傳的檔案（優先）
+    if file is not None:
         return pd.read_excel(file, sheet_name="score")
 
-df = load_score_df(uploaded)
+    # 2) 預設本地檔（你的偏好）
+    candidates = [
+        Path(__file__).resolve().parent / "2025-biochem_molbio_score.xlsx",
+        Path.cwd() / "2025-biochem_molbio_score.xlsx",
+        Path(__file__).resolve().parent / "data" / "2025-biochem_molbio_score.xlsx",
+        Path.cwd() / "data" / "2025-biochem_molbio_score.xlsx",
+    ]
+    for p in candidates:
+        if p.exists():
+            return pd.read_excel(p, sheet_name="score")
 
-required_cols = {"ID", "Biochem", "MolBio", "Week"}
-if not required_cols.issubset(df.columns):
-    st.error(f"缺少必要欄位：{required_cols - set(df.columns)}，請確認 'score' 工作表欄位為 ID, Biochem, MolBio, Week。")
+    # 3) 仍找不到 → 顯示你的自訂錯誤訊息
+    st.error("未上傳檔案，且找不到預設檔")
     st.stop()
 
-# 清理
+# 呼叫
+df = load_score_df(uploaded)
+
+# ========== 欄位檢查與清理 ==========
+required_cols = {"ID", "Biochem", "MolBio", "Week"}
+if not required_cols.issubset(df.columns):
+    st.error(f"缺少必要欄位：{required_cols - set(df.columns)}，請確認 'score' 工作表欄位至少包含 ID, Biochem, MolBio, Week。")
+    st.stop()
+
+# Name 欄可選；若沒有則補空白，後續顯示仍能正常進行
+if "Name" not in df.columns:
+    df["Name"] = ""
+
+# 型別與排序
 df["Week"] = pd.to_numeric(df["Week"], errors="coerce").astype("Int64")
 df = df.dropna(subset=["Week"]).copy()
 df["Week"] = df["Week"].astype(int)
 df = df.sort_values(["ID", "Week"])
 
-# ====== 衍生欄位：學籍與系所 ======
+# ====== 衍生欄位：學籍（是否 413 開頭）、系所（ID 第4-5碼） ======
 def to_str_id(x):
-    # 將 ID 正規化為字串（保留前導 0，如有）
     try:
-        s = str(x)
+        return str(x)
     except Exception:
-        s = ""
-    return s
+        return ""
 
 df["ID_str"] = df["ID"].apply(to_str_id)
 df["應屆"] = df["ID_str"].str.startswith("413")
 
 def dept_from_id(s: str) -> str:
     s = to_str_id(s)
-    # 取第 4-5 碼（1-based），對應 0-based 的 3:5
     code = s[3:5] if len(s) >= 5 else ""
     if code == "01":
         return "醫學系(01)"
@@ -72,37 +84,41 @@ def dept_from_id(s: str) -> str:
 
 df["系所"] = df["ID_str"].apply(dept_from_id)
 
-# 篩選學籍
+# ====== 篩選 ======
 if cohort_opt == "應屆":
     df = df[df["應屆"] == True]
 elif cohort_opt == "非應屆":
     df = df[df["應屆"] == False]
 
-# 篩選系所
 if dept_opt != "全部":
     df = df[df["系所"] == dept_opt]
 
-# 固定 18 週
+# ====== 18 週固定欄位 ======
 WEEKS_FULL = list(range(1, 19))
 
-# 透視表：整數顯示、缺值空白
+# 建立 ID->Name 映射（取每位同學的第一個非空名字）
+id_name_map = (
+    df.sort_values(["ID", "Week"])
+      .groupby("ID")["Name"]
+      .apply(lambda s: s.dropna().iloc[0] if len(s.dropna()) else "")
+)
+
+# ====== 透視表：整數顯示、缺值空白、在 ID 後插入 Name 欄 ======
 def make_pivot(subject_col: str) -> pd.DataFrame:
-    pivot = df.pivot(index="ID", columns="Week", values=subject_col)
-    # 若過濾後無資料，提供空表骨架
-    if pivot.empty:
-        pivot = pd.DataFrame(index=[], columns=WEEKS_FULL)
-    pivot = pivot.sort_index()
+    pivot = df.pivot(index="ID", columns="Week", values=subject_col).sort_index()
     pivot = pivot.reindex(columns=WEEKS_FULL)
     pivot = pivot.applymap(lambda x: int(x) if pd.notna(x) else "")
+    # 插入 Name 欄（Index=ID 之後的第一欄）
+    pivot.insert(0, "Name", pivot.index.map(id_name_map).fillna(""))
     return pivot
 
 bio_pivot = make_pivot("Biochem")
 mol_pivot = make_pivot("MolBio")
 
-# 著色（空白不著色）
+# 著色（空白與字串不著色）
 def color_cell(v):
     try:
-        if v == "":
+        if v == "" or isinstance(v, str):
             return ""
         x = float(v)
     except Exception:
@@ -120,11 +136,11 @@ st.dataframe(bio_pivot.style.applymap(color_cell), use_container_width=True)
 st.subheader("分子生物學（MolBio）")
 st.dataframe(mol_pivot.style.applymap(color_cell), use_container_width=True)
 
-# 任一科連續 win_len 週皆低於紅線（使用篩選後的 df）
+# ====== 警示表：任一科連續 N 週皆低於紅線，並帶出 Name ======
 def consecutive_any_subject_red(df_score: pd.DataFrame, red_threshold: float, window_len: int):
     out_rows = []
     if df_score.empty:
-        return pd.DataFrame(columns=["ID","Weeks","Biochem_scores","MolBio_scores","科目","連續週數","學籍","系所"])
+        return pd.DataFrame(columns=["ID","Name","Weeks","Biochem_scores","MolBio_scores","科目","連續週數","學籍","系所"])
     for sid, g in df_score.groupby("ID"):
         g = g.set_index("Week").reindex(WEEKS_FULL)
         for i in range(len(WEEKS_FULL) - window_len + 1):
@@ -135,10 +151,10 @@ def consecutive_any_subject_red(df_score: pd.DataFrame, red_threshold: float, wi
             cond_bio = (sub["Biochem"] < red_threshold).all()
             cond_mol = (sub["MolBio"] < red_threshold).all()
             if cond_bio or cond_mol:
-                # 從原始 df 取學籍/系所標籤
                 sid_meta = df_score[df_score["ID"] == sid].iloc[0]
                 out_rows.append({
                     "ID": sid,
+                    "Name": sid_meta.get("Name", ""),
                     "Weeks": f"{win_weeks[0]}–{win_weeks[-1]}",
                     "Biochem_scores": tuple(int(x) for x in sub["Biochem"].values),
                     "MolBio_scores": tuple(int(x) for x in sub["MolBio"].values),
@@ -148,9 +164,9 @@ def consecutive_any_subject_red(df_score: pd.DataFrame, red_threshold: float, wi
                     "系所": sid_meta["系所"],
                 })
     if not out_rows:
-        return pd.DataFrame(columns=["ID","Weeks","Biochem_scores","MolBio_scores","科目","連續週數","學籍","系所"])
+        return pd.DataFrame(columns=["ID","Name","Weeks","Biochem_scores","MolBio_scores","科目","連續週數","學籍","系所"])
     df_out = pd.DataFrame(out_rows)
-    df_out = df_out.drop_duplicates(subset=["ID","Weeks","科目","Biochem_scores","MolBio_scores","連續週數"])
+    df_out = df_out.drop_duplicates(subset=["ID","Name","Weeks","科目","Biochem_scores","MolBio_scores","連續週數"])
     return df_out
 
 alert_df = consecutive_any_subject_red(df, red_th, int(win_len))
@@ -162,9 +178,10 @@ else:
     show = alert_df.copy()
     show["Biochem_scores"] = show["Biochem_scores"].apply(lambda xs: "、".join(map(str, xs)))
     show["MolBio_scores"] = show["MolBio_scores"].apply(lambda xs: "、".join(map(str, xs)))
-    st.dataframe(show, use_container_width=True)
+    cols = ["ID","Name","學籍","系所","科目","連續週數","Weeks","Biochem_scores","MolBio_scores"]
+    st.dataframe(show[cols], use_container_width=True)
 
-# 匯出
+# ====== 匯出 ======
 with st.expander("⬇️ 下載目前結果（Excel）"):
     def to_excel_bytes():
         output = BytesIO()
@@ -173,8 +190,7 @@ with st.expander("⬇️ 下載目前結果（Excel）"):
                 return df_in.replace("", pd.NA)
             unblank(bio_pivot).to_excel(writer, sheet_name="Biochem_Pivot")
             unblank(mol_pivot).to_excel(writer, sheet_name="MolBio_Pivot")
-            (alert_df if not alert_df.empty else pd.DataFrame(columns=["ID","Weeks","Biochem_scores","MolBio_scores","科目","連續週數","學籍","系所"]))\
-                .to_excel(writer, sheet_name=f"Red_AnySubject_{int(win_len)}w", index=False)
+            (alert_df if not alert_df.empty else pd.DataFrame(columns=["ID","Name","Weeks","Biochem_scores","MolBio_scores","科目","連續週數","學籍","系所"]))                .to_excel(writer, sheet_name=f"Red_AnySubject_{int(win_len)}w", index=False)
         output.seek(0)
         return output
 
@@ -185,4 +201,4 @@ with st.expander("⬇️ 下載目前結果（Excel）"):
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 
-st.caption("說明：固定顯示 18 週；空白代表未有成績。紅<紅色門檻；黃=紅色門檻~黃色上限；綠>黃色上限。警示邏輯：任一科連續 N 週（可調）皆低於紅線即列出。學籍依 ID 是否以 413 開頭；系所依 ID 第4-5碼（01醫、02牙、03藥）。")
+st.caption("說明：固定顯示 18 週；空白代表未有成績。紅<紅色門檻；黃=紅色門檻~黃色上限；綠>黃色上限。警示邏輯：任一科連續 N 週（可調）皆低於紅線即列出。學籍依 ID 是否以 413 開頭；系所依 ID 第4-5碼（01醫、02牙、03藥）。所有表皆在 ID 後顯示姓名。")
