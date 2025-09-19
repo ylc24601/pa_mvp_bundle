@@ -26,16 +26,32 @@ with st.sidebar:
     st.markdown("---")
     red_th = st.number_input("紅色門檻（含）", min_value=0, max_value=100, value=40, step=1)
     yellow_th = st.number_input("黃色上限（含）", min_value=0, max_value=100, value=60, step=1)
-    win_len = st.number_input("警示連續週數（任一科）", min_value=2, max_value=18, value=3, step=1)
     if yellow_th < red_th:
         st.warning("⚠️ 黃色上限應大於等於紅色門檻（目前黃={yellow} < 紅={red}）。".format(yellow=yellow_th, red=red_th))
+
+    # === 新：AND 規則 ===
+    st.markdown("#### 預警條件（AND 規則）")
+    min_red = st.number_input(
+        "紅燈最低數量（≥）", min_value=0, max_value=18, value=2, step=1,
+        help="在滑動視窗內，紅燈（≤紅線）至少要達到這個數量"
+    )
+    min_total = st.number_input(
+        "紅+黃合計最低數量（≥）", min_value=1, max_value=18, value=4, step=1,
+        help="在滑動視窗內，紅燈+黃燈總數至少要達到這個數量"
+    )
+
+    with st.expander("進階設定"):
+        # 預設把視窗長度 = 合計門檻（直覺做法）；必要時可放大視窗做更寬鬆偵測
+        win_len = st.number_input(
+            "滑動視窗長度（週）", min_value=2, max_value=18, value=int(min_total), step=1,
+            help="預設等於「紅+黃合計最低數量」。你也可以設更大，表示在較長週數視窗內套用相同門檻。"
+        )
+
     st.markdown("---")
-    
-
-    uploaded = st.file_uploader("上傳成績檔（Excel, 需包含 'score' 工作表，欄位：ID, Name, Biochem, MolBio, Week）", type=["xlsx"])
-
-
-
+    uploaded = st.file_uploader(
+        "上傳成績檔（Excel, 需包含 'score' 工作表，欄位：ID, Name, Biochem, MolBio, Week）",
+        type=["xlsx"]
+    )
 
 @st.cache_data(show_spinner=False)
 def load_score_df(file):
@@ -155,26 +171,55 @@ def color_cell(v):
         return "background-color: #d4edda;"
 
 st.subheader("生物化學（Biochem）")
-st.dataframe(bio_pivot.style.map(color_cell), width='stretch' )
+st.dataframe(bio_pivot.style.map(color_cell), use_container_width=True)
 
 st.subheader("分子生物學（MolBio）")
-st.dataframe(mol_pivot.style.map(color_cell), width='stretch')
+st.dataframe(mol_pivot.style.map(color_cell), use_container_width=True)
 
-# 任一科連續 N 週皆低於紅線（保留 Name / 學籍 / 系所）
-def consecutive_any_subject_red(df_score: pd.DataFrame, red_threshold: float, window_len: int):
+# === AND 規則預警（任一科別同時滿足：紅≥min_red 且 紅+黃≥min_total） ===
+def window_any_subject_alert_AND(df_score: pd.DataFrame,
+                                 red_threshold: float,
+                                 yellow_threshold: float,
+                                 window_len: int,
+                                 min_red: int,
+                                 min_total: int) -> pd.DataFrame:
+    """
+    在每位學生的連續視窗（長度 window_len）內，若任一科：
+      - 紅燈數量(<= red_threshold) 累計 >= min_red           AND
+      - 紅燈 + 黃燈數量(<= yellow_threshold) 累計 >= min_total
+    則觸發預警。
+    例：min_red=2, min_total=4 → 2紅2黃、3紅1黃、4紅0黃皆觸發；1紅3黃不觸發。
+    """
     out_rows = []
     if df_score.empty:
-        return pd.DataFrame(columns=["ID","Name","Weeks","Biochem_scores","MolBio_scores","科目","連續週數","學籍","系所"])
+        return pd.DataFrame(columns=["ID","Name","Weeks","Biochem_scores","MolBio_scores","觸發條件","視窗長度","學籍","系所"])
+
     for sid, g in df_score.groupby("ID"):
-        g = g.set_index("Week").reindex(WEEKS_FULL)
+        g = g.set_index("Week").reindex(WEEKS_FULL)[["Biochem","MolBio"]]
         for i in range(len(WEEKS_FULL) - window_len + 1):
             win_weeks = WEEKS_FULL[i:i+window_len]
-            sub = g.loc[win_weeks, ["Biochem", "MolBio"]]
+            sub = g.loc[win_weeks, ["Biochem", "MolBio"]].copy()
+
+            # 視窗內如有缺值 → 略過（可改成允許缺值但只計有分數週）
             if sub.isna().any().any():
                 continue
-            cond_bio = (sub["Biochem"] <= red_threshold).all()
-            cond_mol = (sub["MolBio"] <= red_threshold).all()
-            if cond_bio or cond_mol:
+
+            def counts(series):
+                reds = (series <= red_threshold).sum()
+                yellows = ((series > red_threshold) & (series <= yellow_threshold)).sum()
+                total = reds + yellows
+                return reds, yellows, total
+
+            bio_r, bio_y, bio_t = counts(sub["Biochem"])
+            mol_r, mol_y, mol_t = counts(sub["MolBio"])
+
+            triggers = []
+            if (bio_r >= min_red) and (bio_t >= min_total):
+                triggers.append(f"Biochem：紅≥{min_red} 且 紅+黃≥{min_total}（實得：紅{bio_r}、黃{bio_y}）")
+            if (mol_r >= min_red) and (mol_t >= min_total):
+                triggers.append(f"MolBio：紅≥{min_red} 且 紅+黃≥{min_total}（實得：紅{mol_r}、黃{mol_y}）")
+
+            if triggers:
                 sid_meta = df_score[df_score["ID"] == sid].iloc[0]
                 out_rows.append({
                     "ID": sid,
@@ -182,28 +227,45 @@ def consecutive_any_subject_red(df_score: pd.DataFrame, red_threshold: float, wi
                     "Weeks": f"{win_weeks[0]}–{win_weeks[-1]}",
                     "Biochem_scores": tuple(int(x) for x in sub["Biochem"].values),
                     "MolBio_scores": tuple(int(x) for x in sub["MolBio"].values),
-                    "科目": "Biochem" if cond_bio else "MolBio",
-                    "連續週數": window_len,
+                    "觸發條件": "；".join(triggers),
+                    "視窗長度": window_len,
                     "學籍": sid_meta["學籍分類"],
                     "系所": sid_meta["系所"],
                 })
+
     if not out_rows:
-        return pd.DataFrame(columns=["ID","Name","Weeks","Biochem_scores","MolBio_scores","科目","連續週數","學籍","系所"])
+        return pd.DataFrame(columns=["ID","Name","Weeks","Biochem_scores","MolBio_scores","觸發條件","視窗長度","學籍","系所"])
+
     df_out = pd.DataFrame(out_rows)
-    df_out = df_out.drop_duplicates(subset=["ID","Name","Weeks","科目","Biochem_scores","MolBio_scores","連續週數"])
+    df_out = df_out.drop_duplicates(subset=["ID","Weeks","觸發條件"])
     return df_out
 
-alert_df = consecutive_any_subject_red(df, red_th, int(win_len))
+# 呼叫（預設 win_len = min_total；可在進階設定改）
+alert_df = window_any_subject_alert_AND(
+    df_score=df,
+    red_threshold=red_th,
+    yellow_threshold=yellow_th,
+    window_len=int(win_len),
+    min_red=int(min_red),
+    min_total=int(min_total),
+)
 
-st.subheader(f"⚠️ 任一科連續 {int(win_len)} 週紅色名單（套用目前篩選）")
+# 顯示區塊
+st.subheader(
+    f"⚠️ 預警名單（視窗={int(win_len)} 週；條件：紅≥{int(min_red)} 且 紅+黃≥{int(min_total)}）"
+)
 if alert_df.empty:
-    st.success(f"目前沒有符合『任一科連續 {int(win_len)} 週皆低於紅色門檻』的學生。")
+    st.success("目前沒有符合預警條件的學生。")
 else:
     show = alert_df.copy()
-    show["Biochem_scores"] = show["Biochem_scores"].apply(lambda xs: "、".join(map(str, xs)))
-    show["MolBio_scores"] = show["MolBio_scores"].apply(lambda xs: "、".join(map(str, xs)))
-    cols = ["ID","Name","學籍","系所","科目","連續週數","Weeks","Biochem_scores","MolBio_scores"]
-    st.dataframe(show[cols], width='stretch')
+    if "Biochem_scores" in show.columns:
+        show["Biochem_scores"] = show["Biochem_scores"].apply(lambda xs: "、".join(map(str, xs)))
+    if "MolBio_scores" in show.columns:
+        show["MolBio_scores"] = show["MolBio_scores"].apply(lambda xs: "、".join(map(str, xs)))
+
+    cols = ["ID", "Name", "學籍", "系所", "Weeks", "Biochem_scores", "MolBio_scores"]
+    cols = [c for c in cols if c in show.columns]
+    st.dataframe(show[cols], use_container_width=True)
 
 # 匯出
 with st.expander("⬇️ 下載目前結果（Excel）"):
@@ -214,8 +276,9 @@ with st.expander("⬇️ 下載目前結果（Excel）"):
                 return df_in.replace("", pd.NA)
             unblank(bio_pivot).to_excel(writer, sheet_name="Biochem_Pivot")
             unblank(mol_pivot).to_excel(writer, sheet_name="MolBio_Pivot")
-            (alert_df if not alert_df.empty else pd.DataFrame(columns=["ID","Name","Weeks","Biochem_scores","MolBio_scores","科目","連續週數","學籍","系所"]))\
-                .to_excel(writer, sheet_name=f"Red_AnySubject_{int(win_len)}w", index=False)
+            (alert_df if not alert_df.empty else pd.DataFrame(columns=[
+                "ID","Name","Weeks","Biochem_scores","MolBio_scores","觸發條件","視窗長度","學籍","系所"
+            ])).to_excel(writer, sheet_name=f"Alerts_AND_win{int(win_len)}", index=False)
         output.seek(0)
         return output
 
@@ -226,4 +289,8 @@ with st.expander("⬇️ 下載目前結果（Excel）"):
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 
-st.caption("說明：固定顯示 18 週；空白代表未有成績。紅<紅色門檻；黃=紅色門檻~黃色上限；綠>黃色上限。警示邏輯：任一科連續 N 週（可調）皆低於紅線即列出。學籍依 ID 開頭（<413 重修、=413 應屆、>413 先修）；系所依 ID 第4-5碼。所有表皆在 ID 後顯示姓名。")
+st.caption(
+    "說明：固定顯示 18 週；空白代表未有成績。紅≤紅色門檻；黃=紅色門檻~黃色上限；綠>黃色上限。"
+    "AND 規則：在滑動視窗內，同時滿足「紅燈數量≥設定」且「紅+黃合計≥設定」即列入；預設視窗長度=合計門檻，可在進階設定調整。"
+    "學籍依 ID 開頭（<413 重修、=413 應屆、>413 先修）；系所依 ID 第4-5碼。所有表皆在 ID 後顯示姓名。"
+)
